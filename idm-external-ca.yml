@@ -1,0 +1,215 @@
+---
+# Dont gather facts yet as the new host may not yet exists
+- hosts: idm
+  gather_facts: no
+
+  tasks:
+  - name: Check if VM exists
+    virt: command=info
+    register: lvms
+    delegate_to: localhost
+    when: kickstart_vm
+
+  - name: Check if installation ISO is mounted
+    stat: path={{libvirt_mountpoint }}/.discinfo
+    register: iso_result
+    delegate_to: localhost
+    when: kickstart_vm
+
+  - name: Stop if installation ISO is not mounted and VM does not exists
+    fail: msg="The VM needs to be build but the installation ISO is not mounted. Please mount the RHEL ISO under {{libvirt_mountpoint }} and rerun."
+    when: (iso_result.stat.exists == False and idm_hostname not in lvms.keys() and kickstart_vm)
+    delegate_to: localhost
+
+  - name: Kickstart new VM
+    command: > 
+      virt-install
+        --virt-type kvm
+        --name {{ idm_hostname }}
+        --memory 2048
+        --vcpus 1
+        --location={{ libvirt_mountpoint }}
+        --os-variant rhel7
+        --disk size=10,bus=virtio,pool=images
+        --disk device=cdrom,path={{ libvirt_isopath }},readonly=on
+        --network {{ libvirt_network }}
+        --extra-arg "console=tty0 console=ttyS0,115200n8 ks=file:/{{ libvirt_kickstart|basename }} text ip={{ idm_ip }}::{{ idm_gateway }}:{{ idm_netmask }}:{{ idm_hostname }}.{{ idm_domain }}:eth0:none nameserver={{ idm_dns1 }}"
+        --initrd-inject={{ libvirt_kickstart }}
+        --serial pty
+        --rng /dev/urandom
+        --noreboot
+        --noautoconsole
+        --wait -1
+    when: idm_hostname not in lvms.keys() and kickstart_vm
+    delegate_to: localhost
+
+  - name: Start VM
+    command: virsh start {{ idm_hostname }}
+    when: idm_hostname not in lvms.keys() and kickstart_vm
+    delegate_to: localhost
+
+  - name: Wait 300 seconds for host to become available if we have kickstarted it
+    wait_for:
+      port: 22
+      host: "{{ idm_ip }}"
+      search_regex: OpenSSH
+      delay: 10
+    connection: local
+    when: idm_hostname not in lvms.keys() and kickstart_vm
+
+
+# Now start configuring the host
+- hosts: idm
+
+  tasks:
+  - name: Install base group packages
+    yum: name="@base" state=present
+
+  - name: Install ipa packages
+    yum: name=ipa-server state=present
+
+  - name: Open firewalld ports
+    firewalld: port={{ item }} permanent=true state=enabled
+    with_items:
+      - 80/tcp
+      - 443/tcp
+      - 88/tcp
+      - 88/udp
+      - 464/tcp
+      - 464/udp
+      - 389/tcp
+      - 636/tcp
+    notify: Restart firewalld
+
+
+  # Setup the Root CA 
+  # Based on https://jamielinux.com/docs/openssl-certificate-authority/
+  # but only a single level Root CA where the IPA CA cert will be signed with CA:true
+
+  - name: Create Root CA directory
+    file: name={{ item }} state=directory mode=0700 owner=root group=root
+    with_items: 
+      - /root/ca
+      - /root/ca/certs
+      - /root/ca/crl
+      - /root/ca/csr
+      - /root/ca/newcerts
+      - /root/ca/private
+
+  - name: Create index.txt
+    copy: content="" dest=/root/ca/index.txt force=no owner=root group=root mode=0640
+
+  - name: Create serial
+    shell: echo 1000 > serial
+    args:
+      chdir: /root/ca
+      creates: serial
+  
+  - name: Download openssl.cnf
+    uri: 
+      url: https://jamielinux.com/docs/openssl-certificate-authority/_downloads/root-config.txt
+      dest: /root/ca/openssl.cnf
+      creates: /root/ca/openssl.cnf
+
+  - name: Change default policy for the Root CA (this is only a 1 level CA)
+    lineinfile:
+      path: /root/ca/openssl.cnf
+      regexp: ^policy.*= policy_strict
+      line: policy            = policy_loose
+      state: present
+
+  - name: Create password file
+    shell: 
+      cmd: echo "{{ rootca_keypassword }}" > /root/ca/private/password.txt
+    args:
+      creates: /root/ca/private/password.txt
+
+  - name: Update permissions of /root/ca/private/password.txt
+    file: path=/root/ca/private/password.txt mode=0400
+
+
+  - name: Create Root CA key file
+    command: openssl genrsa -out private/ca.key.pem 4096 -passout file:/root/ca/private/password.txt
+    args:
+      chdir: /root/ca
+      creates: /root/ca/private/ca.key.pem
+
+  - name: Update permission of /root/ca/private/ca.key.pem
+    file: path=/root/ca/private/ca.key.pem mode=0400
+
+  - name: Create Root CA certificate
+    shell:
+      cmd: |
+        openssl req -config openssl.cnf -key private/ca.key.pem \
+          -new -x509 -days 7300 -sha256 -extensions v3_ca \
+          -passin file:/root/ca/private/password.txt \
+          -out certs/ca.cert.pem <<-EOF
+        {{ rootca_country }}
+        {{ rootca_state }}
+        {{ rootca_locality }}
+        {{ rootca_orgname }}
+        {{ rootca_ouname }}
+        {{ rootca_cn }}
+        {{ rootca_email }}
+        EOF
+    args:
+      chdir: /root/ca
+      creates: /root/ca/certs/ca.cert.pem
+
+  - name: Update permissions of /root/ca/cert/ca.cert.pem
+    file: path=/root/ca/certs/ca.cert.pem mode=0444
+
+  - name: Configure IPA by running ipa-server-install to generate csr
+    command: >
+      ipa-server-install -p {{ idm_dmpassword}} \
+        -a {{ idm_adminpassword }} \
+        -r {{idm_realm }} \
+        -n {{ idm_domain }} \
+        --external-ca \
+        --subject-base "O={{ idm_domain }},C={{ rootca_country }}" \
+        --no-ntp \
+        --unattended
+    args:
+      creates: /root/ipa.csr
+
+  - name: Copy /root/ipa.csr to the RootCa dir for signing
+    command: cp /root/ipa.csr /root/ca/csr/ipa.csr
+    args:
+      creates: /root/ca/csr/ipa.csr
+
+  - name: Sign the ipa.csr
+    shell:
+      cmd: |
+        openssl ca -config openssl.cnf \
+          -extensions v3_intermediate_ca \
+          -days 7300 -notext -md sha256 \
+          -passin file:/root/ca/private/password.txt \
+          -in csr/ipa.csr -out certs/ipa.crt <<-EOF
+        y
+        y
+        EOF
+    args:
+      chdir: /root/ca
+      creates: /root/ca/certs/ipa.crt
+
+  - name: Update permissions of /root/ca/certs/ipa.crt
+    file: path=/root/ca/certs/ipa.crt mode=0444
+
+
+  - name: Finish ipa configuration by installing external signed cert and CA cert
+    command: >
+      ipa-server-install
+        --external-cert-file=/root/ca/certs/ipa.crt
+        --external-cert-file=/root/ca/certs/ca.cert.pem
+        -p {{ idm_dmpassword}}
+    args:
+      creates: /etc/ipa/ipa.crt
+
+  # FIXME: https://bugzilla.redhat.com/show_bug.cgi?id=1549187
+  - name: Run ipa-certupdate to deploy CA chain to /usr/share/ipa/html/ca.crt
+    command: /usr/sbin/ipa-certupdate
+
+handlers:
+  - name: Restart firewalld
+    service: name=firewalld state=restarted
+

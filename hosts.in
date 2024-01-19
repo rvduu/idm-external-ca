@@ -1,0 +1,27 @@
+idm:
+  hosts:
+    idm1:
+  vars:
+    ansible_user:        root
+    kickstart_vm:        <true|false>
+    libvirt_isopath:     </var/lib/libvirt/images/rhel-server-7.4-x86_64-dvd.iso>
+    libvirt_mountpoint:  </mnt>
+    libvirt_kickstart:   <rhel-server-7-x86_64.cfg>
+    libvirt_network:     <default>
+    idm_hostname:        <idmserver>
+    idm_ip:              <192.168.1.2>
+    idm_netmask:         <255.255.255.0>
+    idm_gateway:         <192.168.1.1>
+    idm_dns1:            <192.168.1.1>
+    idm_domain:          <domain.example>
+    idm_realm:           "{{ idm_domain|upper }}"
+    idm_dmpassword:      <password>
+    idm_adminpassword:   "{{ idm_dmpassword }}"
+    rootca_keypassword:  "{{ idm_dmpassword }}"
+    rootca_country:      <XX>
+    rootca_state:        <SomeState>
+    rootca_locality:     <SomeCity>
+    rootca_orgname:      <SomeOrg>
+    rootca_ouname:       <SomeOU>
+    rootca_cn:           Root CA
+    rootca_email:        <dev@null.org>
